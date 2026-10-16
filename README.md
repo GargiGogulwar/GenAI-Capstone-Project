@@ -112,6 +112,5 @@ Kraivor exists so that code quality, security posture, and architectural health 
 ---
 
 
-Distributed under the **MIT License**. See [`LICENSE`](./LICENSE) for more information.
 
 
