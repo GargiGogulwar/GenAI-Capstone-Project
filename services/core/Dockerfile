@@ -1,0 +1,86 @@
+﻿# =============================================================================
+# Dockerfile â€” Core Service (Production)
+# =============================================================================
+# Multi-stage build:
+#   Stage 1 (builder) â€” install deps into an isolated venv via uv
+#   Stage 2 (runtime) â€” copy only the venv + app code, no build tools
+# =============================================================================
+
+# â”€â”€ Stage 1: Builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+FROM python:3.14-slim@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4 AS builder
+
+WORKDIR /app
+
+# System deps needed only at build time
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (pinned version for reproducible builds)
+COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
+
+# uv settings
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Copy dependency manifest first â€” Docker cache layer
+COPY pyproject.toml uv.lock /app/
+
+# Install production deps only into /app/.venv
+RUN uv sync --frozen --no-dev
+
+# Copy application source
+COPY . /app/
+
+# â”€â”€ Stage 2: Runtime â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+FROM python:3.14-slim@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4 AS runtime
+
+WORKDIR /app
+
+# Runtime system deps (libpq for psycopg2, curl for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --shell /bin/bash --create-home appuser
+
+# Copy venv from builder
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy application source
+COPY --from=builder /app /app
+
+# Put venv on PATH â€” no `source activate` needed
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Collect static files at build time
+RUN SECRET_KEY=build-time-placeholder \
+    DATABASE_URL=sqlite:///dev-null \
+    python manage.py collectstatic --noinput --clear 2>/dev/null || true
+
+RUN chown -R appuser:appgroup /app
+USER appuser
+
+EXPOSE 8002
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8002/api/health/ || exit 1
+
+CMD ["sh", "-c", \
+     "uvicorn core.asgi:application \
+      --host 0.0.0.0 \
+      --port 8002 \
+      --workers ${WEB_CONCURRENCY:-2} \
+      --timeout-keep-alive 5 \
+      --log-level ${LOG_LEVEL:-info} \
+      --access-log"]

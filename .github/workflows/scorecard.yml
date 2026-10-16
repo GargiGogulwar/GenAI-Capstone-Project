@@ -1,0 +1,50 @@
+name: OpenSSF Scorecard
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+# Declare default read-only permissions for security
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        # Pinned by SHA, not tag, so the image cannot be swapped under us.
+        #
+        # v2.4.0 is unusable: that release pulls its image from
+        # gcr.io/openssf/scorecard-action, and the pull now fails with
+        # "This API method requires billing to be enabled" on the registry
+        # project's account. The image moved to ghcr.io in a later release,
+        # so the failure was a stale pin, not a broken service. This was
+        # failing on dev independently of any branch.
+        #
+        # v2.4.4 also downgrades a failed results POST to a log line instead
+        # of failing the whole job, which the API still does intermittently.
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3
+        with:
+          sarif_file: results.sarif

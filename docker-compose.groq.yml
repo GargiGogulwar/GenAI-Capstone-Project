@@ -1,0 +1,74 @@
+# Local capstone: docker compose -f docker-compose.yml -f docker-compose.groq.yml up -d --build
+services:
+  dynamodb-local:
+    # Docker initializes a new named volume as root; the image's UID 1000
+    # cannot create its SQLite database there without this local-only override.
+    user: "0:0"
+  identity:
+    environment:
+      COOKIE_SECURE: "false"
+      COOKIE_SAMESITE: Lax
+      COOKIE_DOMAIN: ""
+      COOKIE_PATH: /api/auth/
+      EMAIL_BACKEND: ${EMAIL_BACKEND:-django.core.mail.backends.smtp.EmailBackend}
+      EMAIL_HOST: ${EMAIL_HOST:-mailhog}
+      EMAIL_PORT: ${EMAIL_PORT:-1025}
+      EMAIL_USE_TLS: ${EMAIL_USE_TLS:-false}
+      EMAIL_USE_SSL: ${EMAIL_USE_SSL:-false}
+      DEFAULT_FILE_STORAGE: django.core.files.storage.FileSystemStorage
+      SECURE_SSL_REDIRECT: "false"
+    command: sh -c 'python manage.py migrate --noinput && exec gunicorn auth.wsgi:application --bind 0.0.0.0:8001 --workers 2 --threads 2'
+  core:
+    environment:
+      DEFAULT_FILE_STORAGE: django.core.files.storage.FileSystemStorage
+    command: sh -c 'python manage.py migrate --noinput && python manage.py create_chat_table && python manage.py create_chat_v2_table && exec uvicorn core.asgi:application --host 0.0.0.0 --port 8002 --workers 1'
+  analysis:
+    environment:
+      ANALYSIS_S3__BACKEND: local
+      ANALYSIS_S3__LOCAL_PATH: /home/appuser/reports
+      ANALYSIS_AI__TIMEOUT: "180"
+    volumes:
+      - analysis_reports:/home/appuser/reports
+  ai:
+    image: kraivor-groq-ai
+    environment: &groq_environment
+      AI_GROQ_API_KEY: ${GROQ_API_KEY:-${AI_GROQ_API_KEY:-}}
+      AI_GROQ_MODEL: ${AI_GROQ_MODEL:-openai/gpt-oss-120b}
+      AI_GROQ_FAST_MODEL: ${AI_GROQ_FAST_MODEL:-openai/gpt-oss-20b}
+      AI_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-kraivor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-kraivor}
+      AI_REDIS__URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      AI_CELERY__BROKER__URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      AI_CELERY__RESULT__BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      AI_KAFKA__BOOTSTRAP__SERVERS: kafka:9094
+      AI_INTERNAL_REQUEST_SECRET: ${INTERNAL_REQUEST_TOKEN}
+      AI_KEY_ENCRYPTION_KEY: ${AI_KEY_ENCRYPTION_KEY}
+      HF_HOME: /home/appuser/.cache/huggingface
+    volumes:
+      - embedding_models:/home/appuser/.cache/huggingface
+    command: sh -c 'alembic -c alembic.ini upgrade head && exec uvicorn app.api.main:app --host 0.0.0.0 --port 8004 --workers 1'
+  ai-worker:
+    image: kraivor-groq-ai
+    env_file: .env
+    environment: *groq_environment
+    volumes:
+      - embedding_models:/home/appuser/.cache/huggingface
+    depends_on:
+      ai:
+        condition: service_healthy
+    command: celery -A app.core.celery_app worker -Q ai.inference,ai.indexing,ai.maintenance,ai.default --concurrency=1 --loglevel=info
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+  frontend:
+    environment:
+      AI_API_URL: http://ai:8004
+  nginx:
+    volumes:
+      - ./infra/docker/nginx/nginx.groq.conf:/etc/nginx/nginx.conf:ro
+    ports: !override
+      - "${GATEWAY_PORT:-8088}:80"
+  mailhog:
+    profiles: !reset []
+volumes:
+  embedding_models:
+  analysis_reports:

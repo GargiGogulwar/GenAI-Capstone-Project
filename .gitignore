@@ -1,0 +1,154 @@
+# Environment
+.env
+.env.*
+.env.local
+.env.*.local
+.venv
+
+# Secrets & Credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.crt
+*.cer
+*.cert
+*.token
+secrets.*
+credentials.*
+*-credentials.json
+*-key.json
+*-secret*.json
+*-service-account.json
+firebase-service-account.json
+oauth-encryption.key
+.opencode
+.keys/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+terraform.tfvars
+!**/environments/*/terraform.tfvars.example
+.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.egg-info
+.ruff_cache
+.pytest_cache
+.uv-cache
+.mypy_cache
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+
+# TypeScript incremental build cache -- a machine-local artifact. It is rewritten
+# by every `tsc` run, so tracking it shows the file dirty after any build.
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+*/.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage/
+frontend/coverage/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Local media uploads — dev stores avatar/banner on disk
+# (services/auth/auth/settings/development.py; served via /media/)
+media/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# DOCS
+KAIVOR_BLUEPRINT.md
+KRAIVOR_ARCHITECTURE.md
+KRAIVOR_BUILD_GUIDE.md
+CORE_IMPLEMENTATION.md
+frontend-core-service.md
+KRAIVOR_FRONTEND_PROMPT.md
+NEW_CORE_DESIGN.md
+system.md
+tickets.md
+tools.md
+docs/github-app-migration.md
+frontend-projects.md
+ANALYSIS_SERVICE_DESIGN.md
+AI_SERVICE_DESIGN.md
+DEPLOYMENT_DESKTOP.md
+progress.md
+
+services/core/celerybeat-schedule
+
+# Local benchmarking scratch. These were tracked under services/ai/ and were
+# never imported by anything in the repo; they carried the last of the
+# py/empty-except findings. Kept on disk, out of version control.
+services/ai/stress_test.py
+services/ai/stress_test_v3.py
+
+
+docs/handbook
+docs/documents
+# Sensitive credentials
+.env
+.env.*
+!.env.example
+.keys/
+*.pem
+*.key
+
+# Local databases and generated files
+*.sql
+output/
+tmp/
+
+*.bak

@@ -1,0 +1,487 @@
+# =============================================================================
+# docker-compose.dev.yml — Kraivor Development Stack
+# =============================================================================
+# Services for local development with full infrastructure:
+#   postgres · redis · mailhog · dynamodb-local · kafka
+#   identity · core · core-worker · core-beat · core-consumer
+#
+# Usage:
+#   docker-compose -f docker-compose.dev.yml up --build
+#   docker-compose -f docker-compose.dev.yml up          (subsequent runs)
+#   docker-compose -f docker-compose.dev.yml down -v     (nuke everything)
+#
+# Hot reload: edit files in ./services/auth or ./services/core → Django restarts.
+# Emails:     http://localhost:8025 (MailHog web UI)
+# Auth API:   http://localhost:8001/api/auth/
+# Core API:   http://localhost:8002/api/
+# =============================================================================
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11
+    container_name: kraivor-postgres-dev
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kraivor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kraivor}
+      POSTGRES_DB: ${POSTGRES_DB:-kraivor}
+    ports:
+      - "5433:5432"
+    volumes:
+      # PG18 moved PGDATA to /var/lib/postgresql/18/docker and declares
+      # VOLUME /var/lib/postgresql, so a mount on .../data is both the wrong
+      # path and read as leftover pre-18 data -- the entrypoint refuses to
+      # start. Single mount on the parent, as the image asks.
+      - postgres_data_dev:/var/lib/postgresql
+      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kraivor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    container_name: kraivor-redis-dev
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-kraivor_redis_2024}
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-kraivor_redis_2024}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1@sha256:8d76a3d4ffa32a3661311944007a415332c4bb855657f4f6c57996405c009bea
+    container_name: kraivor-mailhog-dev
+    ports:
+      - "1025:1025"   # SMTP — Django EMAIL_HOST_PORT
+      - "8025:8025"   # Web UI — http://localhost:8025
+    logging:
+      driver: "none"
+    restart: unless-stopped
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.6.1@sha256:1856c05cc66a0e49dc1099e483ad2851477eeebe2135250ac11a1d1227db54b1
+    container_name: kraivor-dynamodb-dev
+    ports:
+      - "8007:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    container_name: kraivor-kafka-dev
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,INTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    volumes:
+      - kafka_data_dev:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+# ────── Nginx ─────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    container_name: kraivor-nginx-dev
+    ports:
+    - "80:80"
+    volumes:
+    - ./infra/docker/nginx/nginx.dev.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+    - "host.docker.internal:host-gateway"
+    depends_on:
+      - identity
+      - core
+      - analysis
+      - ai
+    restart: unless-stopped
+
+
+  # ── Auth / Identity Service ─────────────────────────────────────────────────
+
+  identity:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-identity-dev
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: auth.settings.development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      EMAIL_HOST: mailhog
+      EMAIL_PORT: 1025
+      UV_LINK_MODE: copy
+      INTERNAL_REQUEST_TOKEN: ${INTERNAL_REQUEST_TOKEN:-dev-internal-secret}
+      FRONTEND_URL: http://localhost
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    volumes:
+      # Source code mount — edits on host appear instantly inside container
+      - ./services/auth:/app
+      - ./.keys:/.keys
+      # ── venv exclusion fix ──────────────────────────────────────────────────
+      # The image builds the venv at /opt/venv (set by UV_PROJECT_ENVIRONMENT).
+      # Because the venv is NOT under /app, the source volume mount above
+      # cannot shadow or delete it. No named volume trick needed.
+      #
+      # DO NOT add a volume for /app/.venv here — it would be empty and
+      # shadow the image's installed packages, breaking every import.
+      # ────────────────────────────────────────────────────────────────────────
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+    # Override CMD for dev: entrypoint.dev.sh waits for DB then migrates
+    # Remove this if you want to manage migrations manually
+    command: >
+      sh -c "
+        until pg_isready -h postgres -U ${POSTGRES_USER:-kraivor}; do sleep 1; done &&
+        python manage.py migrate --noinput &&
+        python manage.py runserver 0.0.0.0:8001
+      "
+
+  core:
+    build:
+      context: ./services/core
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-core-dev
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      EMAIL_HOST: mailhog
+      EMAIL_PORT: 1025
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      DYNAMODB_LOCAL: "true"
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      UV_LINK_MODE: copy
+      INTERNAL_REQUEST_SECRET: ${INTERNAL_REQUEST_TOKEN:-dev-internal-secret}
+      FRONTEND_URL: http://localhost
+      # ── NOTE ──
+      # Core uses FRONTEND_URL to redirect AFTER GitHub App install.
+      # Must be http://localhost (through nginx), NOT http://localhost:3000.
+      # The auth/identity service at line 137 still uses :3000 because it
+      # redirects users differently (direct to frontend dev server) and that
+      # is intentional.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./services/core:/app
+      - ./.keys:/app/.keys
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    command: >
+      sh -c "
+        until pg_isready -h postgres -U ${POSTGRES_USER:-kraivor}; do sleep 1; done &&
+        python manage.py migrate --noinput &&
+        python manage.py create_chat_table &&
+        python manage.py runserver 0.0.0.0:8002
+      "
+
+  # ── Core Workers ──────────────────────────────────────────────────────────
+
+  core-worker:
+    build:
+      context: ./services/core
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-core-worker-dev
+    command: celery -A core.celery_app worker -Q notifications,default --loglevel=info
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      DYNAMODB_LOCAL: "true"
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./services/core:/app
+    restart: unless-stopped
+
+  core-beat:
+    build:
+      context: ./services/core
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-core-beat-dev
+    command: celery -A core.celery_app beat --loglevel=info
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      DYNAMODB_LOCAL: "true"
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./services/core:/app
+    restart: unless-stopped
+
+  core-consumer:
+    build:
+      context: ./services/core
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-core-consumer-dev
+    command: python manage.py consume_events
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      DYNAMODB_LOCAL: "true"
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./services/core:/app
+    restart: unless-stopped
+
+  # ── Analysis Service ──────────────────────────────────────────────────────
+
+  analysis:
+    build:
+      context: ./services/analysis
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-analysis-dev
+    env_file:
+      - .env
+    environment:
+      ANALYSIS_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-kraivor}:${POSTGRES_PASSWORD:-kraivor}@postgres:5432/${POSTGRES_DB:-kraivor}
+      ANALYSIS_REDIS__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      ANALYSIS_CELERY__BROKER__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      ANALYSIS_CELERY__RESULT__BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      ANALYSIS_KAFKA__BOOTSTRAP__SERVERS: kafka:9094
+      ANALYSIS_IDENTITY__JWKS__URL: http://identity:8001/.well-known/jwks.json
+      ANALYSIS_S3__ENDPOINT__URL: http://minio:9000
+      ANALYSIS_JWT__INTERNAL_REQUEST_SECRET: ${INTERNAL_REQUEST_TOKEN:-dev-internal-secret}
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./services/analysis:/app
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    command: >
+      sh -c "
+        until pg_isready -h postgres -U ${POSTGRES_USER:-kraivor}; do sleep 1; done &&
+        alembic -c migrations/alembic.ini upgrade head &&
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
+      "
+
+  # ── AI Service ──────────────────────────────────────────────────────────────
+
+  ai:
+    image: kraivor-ai:dev
+    build:
+      context: ./services/ai
+      dockerfile: Dockerfile.dev
+    container_name: kraivor-ai-dev
+    env_file:
+      - .env
+    environment:
+      AI_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-kraivor}:${POSTGRES_PASSWORD:-kraivor}@postgres:5432/${POSTGRES_DB:-kraivor}
+      AI_REDIS__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      AI_CELERY__BROKER__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_CELERY__RESULT__BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_KAFKA__BOOTSTRAP__SERVERS: kafka:9094
+      AI_IDENTITY__JWKS__URL: http://identity:8001/.well-known/jwks.json
+      AI_OPENROUTER__MASTER__KEY: ${OPENROUTER_API_KEY}
+      AI_GROQ_API_KEY: ${GROQ_API_KEY}
+      # Default is a valid Fernet key (32 bytes url-safe base64) so a dev
+      # stack boots with no .env. It is deliberately public and is NOT a
+      # production value; docker-compose.yml requires a real key.
+      AI_KEY_ENCRYPTION_KEY: ${AI_KEY_ENCRYPTION_KEY:-0EPSnviQ0OTPxSAJPoflrCyf7p3ssf6JE4uZRnV8D4Y=}
+      AI_INTERNAL_REQUEST_SECRET: ${INTERNAL_REQUEST_TOKEN:-dev-internal-secret}
+      HF_TOKEN: ${HF_TOKEN:-}
+      AI_CORS_ALLOWED_ORIGINS: ${AI_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./services/ai:/app
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    command: >
+      sh -c "
+        alembic -c alembic.ini upgrade head &&
+        exec uvicorn app.api.main:app --host 0.0.0.0 --port 8004 --reload
+      "
+
+  ai-worker:
+    image: kraivor-ai:dev
+    container_name: kraivor-ai-worker-dev
+    healthcheck:
+      disable: true
+    command: celery -A app.core.celery_app worker -Q ai.inference,ai.indexing,ai.maintenance --loglevel=info
+    env_file:
+      - .env
+    environment:
+      AI_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-kraivor}:${POSTGRES_PASSWORD:-kraivor}@postgres:5432/${POSTGRES_DB:-kraivor}
+      AI_REDIS__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      AI_CELERY__BROKER__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_CELERY__RESULT__BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_KAFKA__BOOTSTRAP__SERVERS: kafka:9094
+      AI_OPENROUTER__MASTER__KEY: ${OPENROUTER_API_KEY}
+      # See the comment on the web service above: dev-only public default.
+      AI_KEY_ENCRYPTION_KEY: ${AI_KEY_ENCRYPTION_KEY:-0EPSnviQ0OTPxSAJPoflrCyf7p3ssf6JE4uZRnV8D4Y=}
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ai-beat:
+    image: kraivor-ai:dev
+    container_name: kraivor-ai-beat-dev
+    healthcheck:
+      disable: true
+    command: celery -A app.core.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      AI_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-kraivor}:${POSTGRES_PASSWORD:-kraivor}@postgres:5432/${POSTGRES_DB:-kraivor}
+      AI_REDIS__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/0
+      AI_CELERY__BROKER__URL: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_CELERY__RESULT__BACKEND: redis://:${REDIS_PASSWORD:-kraivor_redis_2024}@redis:6379/1
+      AI_KAFKA__BOOTSTRAP__SERVERS: kafka:9094
+      AI_OPENROUTER__MASTER__KEY: ${OPENROUTER_API_KEY}
+      UV_LINK_MODE: copy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data_dev:
+    name: kraivor_postgres_data_dev
+  kafka_data_dev:
+    name: kraivor_kafka_data_dev

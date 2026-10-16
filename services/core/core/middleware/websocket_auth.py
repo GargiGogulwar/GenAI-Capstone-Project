@@ -1,0 +1,112 @@
+"""
+WebSocket JWT authentication middleware for Django Channels.
+
+Extracts JWT from WebSocket subprotocols (preferred) or query string (?token=...),
+verifies it against the Identity Service JWKS endpoint, and attaches user info
+to the scope.
+
+Subprotocol method (preferred — avoids URL exposure):
+    Client: new WebSocket(url, ['auth', '<jwt_token>'])
+    Server: reads scope["subprotocols"] = ['auth', '<jwt_token>']
+
+Query string method (fallback for backward compatibility):
+    Client: new WebSocket(url + '?token=<jwt_token>')
+    Server: reads query_string params
+
+Usage:
+    from channels.routing import ProtocolTypeRouter, URLRouter
+    from core.middleware.websocket_auth import JWTAuthMiddleware
+
+    application = ProtocolTypeRouter({
+        "websocket": JWTAuthMiddleware(URLRouter(...)),
+    })
+"""
+
+import jwt
+import logging
+from channels.db import database_sync_to_async
+from channels.middleware import BaseMiddleware
+from django.conf import settings
+from urllib.parse import parse_qs
+
+from core.middleware.jwt_auth import _get_jwks_client
+
+logger = logging.getLogger(__name__)
+
+
+class JWTAuthMiddleware(BaseMiddleware):
+    async def __call__(self, scope, receive, send):
+        token = None
+
+        # ── Preferred: extract from subprotocol ['auth', '<jwt>'] ───────────
+        subprotocols = scope.get("subprotocols", [])
+        if len(subprotocols) >= 2 and subprotocols[0] == "auth":
+            token = subprotocols[1]
+
+        # ── Fallback: query string ?token=... ───────────────────────────────
+        if not token:
+            query_string = scope.get("query_string", b"").decode("utf-8")
+            params = parse_qs(query_string)
+            token = params.get("token", [None])[0]
+
+        if not token:
+            logger.warning("websocket.auth.no_token")
+            await send({"type": "websocket.close", "code": 4001})
+            return
+
+        try:
+            payload = await database_sync_to_async(self._verify_token)(token)
+        except jwt.ExpiredSignatureError:
+            logger.warning("websocket.auth.token_expired")
+            await send({"type": "websocket.close", "code": 4002})
+            return
+        except jwt.InvalidTokenError as exc:
+            logger.warning("websocket.auth.invalid_token: %s", exc)
+            await send({"type": "websocket.close", "code": 4003})
+            return
+        except Exception as exc:
+            logger.error("websocket.auth.error: %s", exc, exc_info=True)
+            await send({"type": "websocket.close", "code": 4001})
+            return
+
+        # A signature-valid token carrying no subject identifies nobody. The
+        # previous code stored `payload.get("sub") or payload.get("user_id")`
+        # unconditionally, so such a token produced scope["user_id"] = None and
+        # the handshake was allowed through. Every consumer happens to re-check
+        # `if not self.user_id` and close 4001 itself, but that put the
+        # authorization decision in four consumers instead of one place, and a
+        # consumer that did not re-check would have accepted an anonymous
+        # socket. Reject here instead.
+        user_id = payload.get("sub") or payload.get("user_id")
+        if not user_id:
+            logger.warning("websocket.auth.no_subject")
+            await send({"type": "websocket.close", "code": 4001})
+            return
+
+        scope["user_id"] = user_id
+        scope["user_name"] = payload.get("name") or payload.get("email", "")
+        scope["email"] = payload.get("email")
+        scope["workspace_ids"] = payload.get("workspace_ids", [])
+        scope["roles"] = payload.get("roles", {})
+        scope["jwt_payload"] = payload
+
+        return await super().__call__(scope, receive, send)
+
+    @staticmethod
+    def _verify_token(token: str) -> dict:
+        client = _get_jwks_client()
+        signing_key = client.get_signing_key_from_jwt(token)
+        decode_options = {
+            "verify_exp": getattr(settings, "JWT_VERIFY_EXPIRATION", True)
+        }
+        audience = getattr(settings, "JWT_AUDIENCE", None)
+        issuer = getattr(settings, "JWT_ISSUER", None)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=audience,
+            issuer=issuer,
+            options=decode_options,
+        )
+        return payload

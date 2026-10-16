@@ -1,0 +1,114 @@
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field, model_validator, field_validator
+
+
+class StartAnalysisRequest(BaseModel):
+    repo_id: UUID
+    workspace_id: UUID
+    repo_url: str
+    branch: str = "main"
+    deep_scan: bool = False
+    depth: int = Field(default=1, ge=1, le=10)
+
+    @field_validator("repo_url")
+    @classmethod
+    def public_repository_url(cls, value: str) -> str:
+        from urllib.parse import urlsplit
+        parts = urlsplit(value)
+        if parts.scheme != "https" or parts.hostname not in {"github.com", "gitlab.com", "bitbucket.org"} or parts.username or parts.password:
+            raise ValueError("Use an HTTPS GitHub, GitLab, or Bitbucket repository URL, or upload a ZIP")
+        return value
+
+
+class LanguageShare(BaseModel):
+    """One language's share of the repository's lines.
+
+    `percentage` is a share of lines attributed to a language, not of all lines:
+    blank and non-source files are excluded, so the entries do not necessarily
+    sum to 100.
+    """
+
+    name: str
+    percentage: float
+
+
+class EngineState(BaseModel):
+    """Per-engine execution state for one job.
+
+    Rows written before per-engine timings existed hold a bare status string.
+    `mode="before"` upgrades those on read, so historical and in-flight jobs
+    serialise in the same shape as new ones and no data migration is needed for
+    a column that is already JSON.
+    """
+
+    status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    error: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_string(cls, value: object) -> object:
+        if isinstance(value, str):
+            return {"status": value}
+        return value
+
+
+class EngineInfo(BaseModel):
+    """One engine from the canonical catalogue."""
+
+    key: str
+    label: str
+    description: str
+    stage: str
+    score_category: str | None = None
+
+
+class EngineListResponse(BaseModel):
+    engines: list[EngineInfo]
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    repo_id: UUID
+    workspace_id: UUID
+    status: str
+    repo_url: str
+    branch: str = "main"
+    progress_pct: float = 0.0
+    progress_message: str = ""
+    total_findings: int = 0
+    total_files: int | None = None
+    total_lines: int | None = None
+    overall_score: int | None = None
+    blocked_by: list[str] = []
+    engine_statuses: dict[str, EngineState] = {}
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    # Null until clone has detected them. Optional rather than defaulted to []
+    # because "not measured yet" and "measured, found none" are different answers
+    # and the sidebar has to be able to tell them apart to show a skeleton.
+    languages_detected: list[str] | None = None
+    language_breakdown: list[LanguageShare] | None = None
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobStatusResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class JobStatisticsResponse(BaseModel):
+    findings_count: int
+    dead_code_count: int
+    error_findings_count: int
+    performance_metrics_count: int
+    simulation_results_count: int
+    enterprise_guide_exists: bool
+    counts_by_severity: dict[str, int]
+    counts_by_category: dict[str, int]

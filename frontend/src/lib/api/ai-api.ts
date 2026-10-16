@@ -1,0 +1,338 @@
+import { useAuthStore } from '@/lib/stores/auth-store';
+import { authenticatedFetch } from './authenticated-fetch';
+import type { SendMessagePayload, ChatMessage, DailyUsage } from '@/types/domain/ai';
+
+/* ─── AI Service Base URL ────────────────────────────────── */
+
+const AI_BASE = '/api/ai';
+
+/* ─── Frontend model ID → Backend model ID mapping ──────── */
+
+export function resolveModelId(frontendId: string): string {
+  if (frontendId === 'openai/gpt-oss-20b' || frontendId === 'groq-fast') return 'openai/gpt-oss-20b';
+  if (frontendId === 'krait-2.0' || !frontendId) return 'openai/gpt-oss-120b';
+  return frontendId;
+}
+
+/* ─── Model listing types ────────────────────────────────── */
+
+export type ModelTier = 'kraivor' | 'groq' | 'free' | 'byok';
+
+export interface ModelItem {
+  id: string;
+  name: string;
+  tier: ModelTier;
+  provider: string;
+  backendModel: string;
+  latency?: string;
+  context?: string;
+  icon?: string;
+  iconKey?: string;
+}
+
+/* ─── BYOK types ──────────────────────────────────────────── */
+
+export type ByokProvider = 'openrouter' | 'anthropic' | 'openai' | 'google' | 'deepseek' | 'xai' | 'groq';
+
+export interface ByokKeyStatus {
+  hasKey: boolean;
+  provider: ByokProvider;
+  modelCount: number;
+}
+
+/* ─── Auth helper ────────────────────────────────────────── */
+
+function getJwt(): string | null {
+  if (typeof window === 'undefined') return null;
+  return useAuthStore.getState().accessToken;
+}
+
+/* ─── Error ──────────────────────────────────────────────── */
+
+export type ErrorSuggestedAction = 'add_key' | 'switch_model' | 'wait' | 'retry' | 'new_conversation' | 'check_key';
+
+export class AiApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public suggestedAction?: ErrorSuggestedAction,
+    public retryAfter?: number | null,
+  ) {
+    super(message);
+    this.name = 'AiApiError';
+  }
+}
+
+/* ─── API Client ─────────────────────────────────────────── */
+
+export interface EnrichFindingItem {
+  title: string;
+  category: string;
+  severity: string;
+  description: string;
+  recommendation: string;
+  file_path: string;
+  line_start: number | null;
+  line_end: number | null;
+  code_snippet: string;
+}
+
+export interface EnrichRequest {
+  findings: EnrichFindingItem[];
+  overall_score?: number | null;
+  tier?: string | null;
+  languages?: string[] | null;
+  frameworks?: string[] | null;
+}
+
+export interface EnrichedFindingItem extends EnrichFindingItem {
+  ai_explanation: string;
+  ai_recommendation: string;
+  is_ai_enriched: boolean;
+}
+
+export interface EnrichResponse {
+  findings: EnrichedFindingItem[];
+  ai_executive_summary: string;
+}
+
+export interface ProvisionResponse {
+  provider: string;
+  model_access: string[];
+  rate_limit: Record<string, unknown>;
+  provisioned_at: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  model: string | null;
+  message_count: number;
+  is_pinned: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HistoryMessage {
+  id: string;
+  role: string;
+  content: string;
+  model: string | null;
+  created_at: string;
+}
+
+export interface ConversationListResponse {
+  conversations: ConversationSummary[];
+  total: number;
+}
+
+export interface MessageListResponse {
+  messages: HistoryMessage[];
+  conversation_id: string;
+  total: number;
+}
+
+export const aiApi = {
+  async enrichAnalysis(request: EnrichRequest): Promise<EnrichResponse> {
+    return aiPost<EnrichResponse>('/v1/analysis/enrich', request);
+  },
+
+  async provisionApiKey(provider: string, _apiKey?: string): Promise<ProvisionResponse> {
+    return aiPost<ProvisionResponse>('/v1/api-keys/provision', { provider, tier: 'free' });
+  },
+
+  async listConversations(workspaceId?: string): Promise<ConversationListResponse> {
+    const params = new URLSearchParams({ limit: '50' });
+    if (workspaceId) params.set('workspace_id', workspaceId);
+    return aiFetch<ConversationListResponse>(`/v1/conversations?${params}`);
+  },
+
+  async getMessages(conversationId: string): Promise<MessageListResponse> {
+    return aiFetch<MessageListResponse>(`/v1/conversations/${conversationId}/messages?limit=500`);
+  },
+
+  /* ─── Dynamic model listing ─────────────────────────────── */
+
+  async listModels(): Promise<{ models: ModelItem[]; default: string }> {
+    return aiFetch<{ models: ModelItem[]; default: string }>('/v1/models');
+  },
+
+  /* ─── BYOK key management ──────────────────────────────── */
+
+  async submitByokKey(provider: ByokProvider, apiKey: string): Promise<{ ok: boolean }> {
+    return aiPost('/v1/byok/submit', { provider, api_key: apiKey });
+  },
+
+  async getByokStatus(): Promise<{ providers: Record<string, boolean> }> {
+    return aiFetch<{ providers: Record<string, boolean> }>('/v1/byok/status');
+  },
+
+  async removeByokKey(provider: ByokProvider): Promise<{ ok: boolean }> {
+    return aiFetch(`/v1/byok/${provider}`, { method: 'DELETE' } as RequestInit);
+  },
+
+  /* ─── Daily usage ─────────────────────────────────────── */
+
+  async getDailyUsage(): Promise<DailyUsage> {
+    return aiFetch<DailyUsage>('/v1/usage/daily');
+  },
+
+  /* ─── Send message ─────────────────────────────────────── */
+
+  async sendMessage(payload: SendMessagePayload): Promise<ChatMessage> {
+    const model = payload.model ? resolveModelId(payload.model) : undefined;
+    return aiPost<ChatMessage>('/v1/chat', {
+      message: payload.content,
+      conversation_id: payload.sessionId,
+      workspace_id: useAuthStore.getState().workspaceId,
+      repo_ids: payload.repo_ids,
+      stream: false,
+      model,
+      mode: payload.mode || 'normal',
+    });
+  },
+
+  async updateConversation(
+    conversationId: string,
+    data: { title?: string; is_pinned?: boolean },
+  ): Promise<ConversationSummary> {
+    return aiPatch<ConversationSummary>(`/v1/conversations/${conversationId}`, data);
+  },
+
+  async deleteConversation(conversationId: string): Promise<{ ok: boolean }> {
+    return aiFetch<{ ok: boolean }>(`/v1/conversations/${conversationId}`, { method: 'DELETE' } as RequestInit);
+  },
+
+  async *streamMessage(payload: SendMessagePayload, signal?: AbortSignal) {
+    const model = payload.model ? resolveModelId(payload.model) : undefined;
+    const workspaceId = useAuthStore.getState().workspaceId;
+
+    const response = await authenticatedFetch(`${AI_BASE}/v1/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(getJwt() ? { Authorization: `Bearer ${getJwt()}` } : {}),
+      },
+      body: JSON.stringify({
+        message: payload.content,
+        conversation_id: payload.sessionId,
+        workspace_id: workspaceId,
+        repo_ids: payload.repo_ids,
+        stream: true,
+        model,
+        mode: payload.mode || 'normal',
+      }),
+      signal,
+    });
+
+    if (response.status === 429) {
+      const body = await response.json().catch(() => ({}));
+      throw new AiApiError(429, 'rate_limited', body.message || 'Rate limit reached.', 'wait', body.retry_after);
+    }
+
+    if (response.status === 402) {
+      const body = await response.json().catch(() => ({}));
+      throw new AiApiError(402, body.error || 'insufficient_quota', body.message || 'AI credits exhausted.', 'add_key');
+    }
+
+    if (response.status === 503) {
+      const body = await response.json().catch(() => ({}));
+      throw new AiApiError(503, body.error || 'provider_unavailable', body.message || 'Provider unavailable.', 'retry');
+    }
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new AiApiError(response.status, body.error || 'stream_failed', body.message || 'Stream failed');
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) return;
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: error')) {
+          continue;
+        }
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') return;
+          try {
+            const parsed = JSON.parse(data);
+            // Yield structured error events so the consumer can handle them inline
+            if (parsed.type === 'error' || parsed.error) {
+              yield {
+                type: 'error',
+                error: parsed.error || 'An error occurred',
+                category: parsed.category || 'unknown',
+                suggested_action: parsed.suggested_action,
+                retry_after: parsed.retry_after,
+                status: parsed.status || 500,
+              } as Record<string, unknown>;
+              return;
+            }
+            yield parsed;
+          } catch {
+            // JSON parse failure — yield raw data as fallback
+            yield data as unknown as Record<string, unknown>;
+          }
+        }
+      }
+    }
+  },
+
+
+};
+
+/* ─── Low-level fetch helpers ────────────────────────────── */
+
+async function aiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const url = `${AI_BASE}${path}`;
+  const token = getJwt();
+
+  const res = await authenticatedFetch(url, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init.headers as Record<string, string>),
+    },
+  });
+
+  if (res.status === 204) return undefined as T;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new AiApiError(
+      res.status,
+      body.error ?? body.code ?? 'unknown_error',
+      (typeof body.detail === 'object' ? body.detail?.message : body.detail) ?? body.message ?? 'Request failed',
+      body.suggested_action as ErrorSuggestedAction | undefined,
+      body.retry_after,
+    );
+  }
+  return body as T;
+}
+
+async function aiPost<T>(path: string, body: unknown): Promise<T> {
+  return aiFetch<T>(path, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+async function aiPatch<T>(path: string, body: unknown): Promise<T> {
+  return aiFetch<T>(path, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}

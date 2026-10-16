@@ -1,0 +1,255 @@
+"""
+Security utilities for authentication - KRV-011.
+
+Provides:
+- Constant-time password comparison (prevents timing attacks)
+- Login lockout with Redis (5 failures → 15 minute lockout)
+- Device ID generation
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import ipaddress
+import logging
+import redis
+from django.conf import settings
+from django.contrib.auth.hashers import check_password as django_check_password
+from auth.logging_utils import log_safe
+
+logger = logging.getLogger(__name__)
+
+
+class LoginLockoutError(Exception):
+    """Raised when account is locked due to too many failed attempts."""
+
+    def __init__(self, retry_after: int, email: str) -> None:
+        self.retry_after = retry_after
+        self.email = email
+        super().__init__(f"Account locked. Try again in {retry_after} seconds.")
+
+
+class LoginLockoutUnavailableError(Exception):
+    """Raised when Redis cannot answer whether an identity is locked out.
+
+    The lockout counter is the only thing standing between an attacker and
+    unlimited password guessing, so an unreachable Redis is not permission to
+    guess. This is raised rather than swallowed: a "safe default" of "not
+    locked" is indistinguishable from "no lockout is in force", which is
+    precisely the state an attacker wants during an outage.
+    """
+
+
+class LoginLockoutManager:
+    """
+    Redis-based login lockout manager.
+
+    Tracks failed login attempts per email+IP combination.
+    After 5 failures, locks out for 15 minutes.
+
+    The security-relevant operations -- `check_lockout` and `record_failure` --
+    raise `LoginLockoutUnavailableError` when Redis is unreachable, so an
+    outage denies sign-in rather than removing the throttle. `clear_attempts`
+    is the one exception and stays best-effort: it runs *after* credentials
+    have already been accepted, so failing there would reject a login that
+    genuinely succeeded. The worst case of skipping it is a stale attempt
+    count that locks a real user out slightly early, which is the safe
+    direction.
+    """
+
+    LOCKOUT_PREFIX = "login_lockout"
+    ATTEMPTS_PREFIX = "login_attempts"
+
+    def __init__(self, redis_url: str | None = None) -> None:
+        url = redis_url or settings.REDIS_URL
+        self.client: redis.Redis = redis.from_url(url, decode_responses=True)
+
+    def _get_lockout_key(self, email: str, ip: str) -> str:
+        return f"{self.LOCKOUT_PREFIX}:{email.lower()}:{ip}"
+
+    def _get_attempts_key(self, email: str, ip: str) -> str:
+        return f"{self.ATTEMPTS_PREFIX}:{email.lower()}:{ip}"
+
+    def check_lockout(self, email: str, ip: str) -> tuple[bool, int]:
+        """
+        Check if email+IP is locked out.
+
+        Returns:
+            (is_locked, retry_after_seconds)
+
+        Raises:
+            LoginLockoutUnavailableError: if Redis cannot be reached. Returning
+                `(False, 0)` here would read as "no lockout in force" and allow
+                unlimited password attempts for the duration of the outage.
+        """
+        try:
+            lockout_key = self._get_lockout_key(email, ip)
+            ttl = self.client.ttl(lockout_key)
+
+            if ttl > 0:
+                return True, ttl
+            return False, 0
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            logger.error(
+                "auth.lockout_check_unavailable",
+                extra={"email": log_safe(email.lower()), "error": log_safe(e)},
+            )
+            raise LoginLockoutUnavailableError(
+                "Could not verify whether this account is locked."
+            ) from e
+
+    def record_failure(self, email: str, ip: str) -> int:
+        """
+        Record a failed login attempt.
+
+        Returns:
+            Number of failed attempts after this one.
+
+        Raises:
+            LoginLockoutUnavailableError: if Redis cannot be reached. Returning
+                0 would leave the counter where it was, so the next attempt
+                would also record 0 and the threshold would never be crossed.
+        """
+        try:
+            attempts_key = self._get_attempts_key(email, ip)
+            lockout_key = self._get_lockout_key(email, ip)
+
+            lockout_seconds = settings.LOGIN_LOCKOUT_MINUTES * 60
+
+            pipe = self.client.pipeline()
+            pipe.incr(attempts_key)
+            pipe.expire(attempts_key, lockout_seconds)
+            results = pipe.execute()
+
+            failed_attempts = results[0]
+
+            if failed_attempts >= settings.LOGIN_MAX_FAILURES:
+                pipe = self.client.pipeline()
+                pipe.setex(lockout_key, lockout_seconds, 1)
+                pipe.delete(attempts_key)
+                pipe.execute()
+
+            return failed_attempts
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            logger.error(
+                "auth.lockout_record_failed",
+                extra={"email": log_safe(email.lower()), "error": log_safe(e)},
+            )
+            raise LoginLockoutUnavailableError(
+                "Could not record the failed attempt."
+            ) from e
+
+    def clear_attempts(self, email: str, ip: str) -> None:
+        """Clear failed attempts after successful login.
+
+        Best-effort by design -- see the class docstring. Runs only after the
+        credentials have already been accepted, so an outage here must not turn
+        a successful login into a 503.
+        """
+        try:
+            attempts_key = self._get_attempts_key(email, ip)
+            lockout_key = self._get_lockout_key(email, ip)
+
+            pipe = self.client.pipeline()
+            pipe.delete(attempts_key)
+            pipe.delete(lockout_key)
+            pipe.execute()
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            logger.warning(
+                "auth.lockout_clear_failed",
+                extra={"email": log_safe(email.lower()), "error": log_safe(e)},
+            )
+
+    def is_allowed(self, email: str, ip: str) -> bool:
+        """Check if login is allowed (not locked out)."""
+        is_locked, _ = self.check_lockout(email, ip)
+        return not is_locked
+
+
+def constant_time_compare(a: str, b: str) -> bool:
+    """
+    Constant-time comparison to prevent timing attacks.
+
+    Uses hmac.compare_constant_time if available (Python 3.3+),
+    otherwise falls back to manual implementation.
+    """
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+def check_password(plain_password: str, hashed_password: str) -> bool:
+    """
+    Check password using Django's built-in constant-time comparison.
+
+    Django's check_password already uses constant-time algorithms
+    (PBKDF2, Argon2) which are timing-attack resistant by design.
+    """
+    return django_check_password(plain_password, hashed_password)
+
+
+def generate_device_id(request) -> str:
+    """
+    Generate a device ID from request headers and IP.
+
+    Combines User-Agent, Accept-Language, and IP to create
+    a unique but stable device identifier.
+    """
+    user_agent = request.META.get("HTTP_USER_AGENT", "") if request else ""
+    accept_language = request.META.get("HTTP_ACCEPT_LANGUAGE", "") if request else ""
+    ip = get_client_ip(request)
+
+    raw = f"{user_agent}:{accept_language}:{ip}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _valid_ip(candidate: str) -> str | None:
+    """Return `candidate` as a normalised IP, or None if it is not one.
+
+    `X-Forwarded-For` is a request header, so it is attacker-controlled
+    text. It used to be trusted verbatim after `.strip()`, which is not
+    enough: `strip()` only trims the ends, so an embedded CR/LF survived,
+    as did a value containing `:`.
+    """
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def get_client_ip(request) -> str:
+    """Extract the client IP from a request, tolerating a reverse proxy.
+
+    An `X-Forwarded-For` value is only used when the first hop parses as an
+    IP address; anything else falls back to `REMOTE_ADDR`. This value is
+    interpolated into audit log lines and used to build the Redis keys that
+    `LoginLockoutManager` counts attempts against, so accepting arbitrary
+    header text let a caller forge log entries and inject key separators.
+    """
+    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if x_forwarded_for:
+        first_hop = x_forwarded_for.split(",")[0].strip()
+        forwarded = _valid_ip(first_hop)
+        if forwarded is not None:
+            return forwarded
+        logger.warning(
+            "auth.client_ip.invalid_x_forwarded_for", extra={"value": log_safe(first_hop[:64])}
+        )
+
+    return _valid_ip(request.META.get("REMOTE_ADDR", "")) or "127.0.0.1"
+
+
+_lockout_manager: LoginLockoutManager | None = None
+
+
+def get_lockout_manager() -> LoginLockoutManager:
+    """Get or create the login lockout manager singleton."""
+    global _lockout_manager
+    if _lockout_manager is None:
+        _lockout_manager = LoginLockoutManager()
+    return _lockout_manager
+
+
+def reset_lockout_manager() -> None:
+    """Reset the lockout manager singleton - useful for testing."""
+    global _lockout_manager
+    _lockout_manager = None
