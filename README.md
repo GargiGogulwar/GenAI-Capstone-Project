@@ -114,6 +114,4 @@ Kraivor exists so that code quality, security posture, and architectural health 
 
 Distributed under the **MIT License**. See [`LICENSE`](./LICENSE) for more information.
 
-<p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/nkswalih">Mohammed Swalih N K</a> and the Kraivor community.</sub>
-</p>
+
