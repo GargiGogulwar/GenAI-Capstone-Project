@@ -15,17 +15,7 @@ demonstration steps, and end-to-end verification.
 
   <br>
 
-  <!-- Badges -->
-
-  <p>
-    <a href="https://github.com/nkswalih/kraivor/actions"><img src="https://img.shields.io/github/actions/workflow/status/nkswalih/kraivor/ci.yml?style=flat-square&logo=github&label=build" alt="Build Status"></a>
-    <a href="https://github.com/nkswalih/kraivor/blob/dev/LICENSE"><img src="https://img.shields.io/github/license/nkswalih/kraivor?style=flat-square&color=blue" alt="License"></a>
-    <!-- <a href="https://github.com/nkswalih/kraivor/releases"><img src="https://img.shields.io/github/v/release/nkswalih/kraivor?style=flat-square&logo=semver" alt="Version"></a> -->
-    <a href="https://github.com/nkswalih/kraivor/stargazers"><img src="https://img.shields.io/github/stars/nkswalih/kraivor?style=flat-square&logo=github" alt="Stars"></a>
-    <a href="https://github.com/nkswalih/kraivor/graphs/contributors"><img src="https://img.shields.io/github/contributors/nkswalih/kraivor?style=flat-square&logo=contributorcovenant" alt="Contributors"></a>
-    <a href="https://github.com/nkswalih/kraivor/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square&logo=github" alt="PRs Welcome"></a>
-    <a href="https://discord.gg/rgdV8Uh6D"><img src="https://img.shields.io/badge/chat-discord-5865F2?style=flat-square&logo=discord" alt="Discord"></a>
-  </p>
+  
   
   <p>Kraivor is a unified developer intelligence platform that combines a <strong>Repository Analyzer</strong>, <strong>Agentic AI System</strong>, and <strong>Developer Productivity Platform</strong> into a single authenticated workspace — giving engineering teams deep code insights, AI-powered assistance, and a collaborative hub, all out of the box.</p>
 </div>
